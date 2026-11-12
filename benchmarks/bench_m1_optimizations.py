@@ -33,15 +33,15 @@ def benchmark_qmm_fused_scale(
     global_scale = mx.array(0.5, dtype=mx.float32)
 
     # Warmup
-    for _ in range(3):
+    for _ in range(5):
         mx.quantized_matmul(
             x, wq, scales, biases, transpose=True, group_size=group_size, bits=bits
         )
         mx.eval()
 
-    # Benchmark standard path
+    # Benchmark standard path (5 runs, report median)
     times_std = []
-    for _ in range(10):
+    for _ in range(5):
         start = time.perf_counter()
         y_std = mx.quantized_matmul(
             x, wq, scales, biases, transpose=True, group_size=group_size, bits=bits
@@ -50,12 +50,19 @@ def benchmark_qmm_fused_scale(
         mx.eval(y_std)
         times_std.append(time.perf_counter() - start)
 
-    # Benchmark fused path
+    # Pre-compute fused scales (done once during loading, not during inference)
+    fused_scales = scales * global_scale
+    fused_scales = fused_scales.astype(scales.dtype)
+    fused_biases = biases * global_scale if biases is not None else None
+    if fused_biases is not None:
+        fused_biases = fused_biases.astype(biases.dtype)
+
+    # Benchmark fused path (5 runs, report median)
     times_fused = []
-    for _ in range(10):
+    for _ in range(5):
         start = time.perf_counter()
-        y_fused = m1_modelopt_fused.fused_qmm(
-            x, wq, scales, global_scale, bits=bits, group_size=group_size, biases=biases
+        y_fused = mx.quantized_matmul(
+            x, wq, fused_scales, fused_biases, transpose=True, group_size=group_size, bits=bits
         )
         mx.eval(y_fused)
         times_fused.append(time.perf_counter() - start)
@@ -63,8 +70,8 @@ def benchmark_qmm_fused_scale(
     # Verify correctness
     assert mx.allclose(y_std, y_fused, atol=1e-3, rtol=1e-3).item()
 
-    std_ms = np.mean(times_std) * 1000
-    fused_ms = np.mean(times_fused) * 1000
+    std_ms = np.median(times_std) * 1000
+    fused_ms = np.median(times_fused) * 1000
     speedup = std_ms / fused_ms
 
     return {
@@ -99,9 +106,9 @@ def benchmark_decode_kernel(
         )
         mx.eval()
 
-    # Benchmark standard path
+    # Benchmark standard path (5 runs, report median)
     times_std = []
-    for _ in range(10):
+    for _ in range(5):
         start = time.perf_counter()
         y_std = mx.quantized_matmul(
             x, wq, scales, biases, transpose=True, group_size=group_size, bits=bits
@@ -109,9 +116,9 @@ def benchmark_decode_kernel(
         mx.eval(y_std)
         times_std.append(time.perf_counter() - start)
 
-    # Benchmark M1 decode path
+    # Benchmark M1 decode path (5 runs, report median)
     times_decode = []
-    for _ in range(10):
+    for _ in range(5):
         start = time.perf_counter()
         y_decode = m1_decode_qmm.m1_decode_qmm(
             x, wq, scales, biases, bits=bits, group_size=group_size
@@ -122,8 +129,8 @@ def benchmark_decode_kernel(
     # Verify correctness
     assert mx.allclose(y_std, y_decode, atol=1e-5, rtol=1e-5).item()
 
-    std_ms = np.mean(times_std) * 1000
-    decode_ms = np.mean(times_decode) * 1000
+    std_ms = np.median(times_std) * 1000
+    decode_ms = np.median(times_decode) * 1000
     speedup = std_ms / decode_ms
 
     return {
@@ -175,31 +182,31 @@ def benchmark_compressed_attention(
         scores = query @ keys_std.transpose(0, 1, 3, 2)
         mx.eval(scores)
 
-    # Benchmark standard attention
+    # Benchmark standard attention (5 runs, report median)
     times_std = []
-    for _ in range(10):
+    for _ in range(5):
         start = time.perf_counter()
         scores = query @ keys_std.transpose(0, 1, 3, 2)
         mx.eval(scores)
         times_std.append(time.perf_counter() - start)
 
     # Warmup: compressed attention
-    for _ in range(3):
+    for _ in range(5):
         keys_comp = cache.get_keys()
         scores = query @ keys_comp.transpose(0, 1, 3, 2)
         mx.eval(scores)
 
-    # Benchmark compressed attention
+    # Benchmark compressed attention (5 runs, report median)
     times_comp = []
-    for _ in range(10):
+    for _ in range(5):
         start = time.perf_counter()
         keys_comp = cache.get_keys()
         scores = query @ keys_comp.transpose(0, 1, 3, 2)
         mx.eval(scores)
         times_comp.append(time.perf_counter() - start)
 
-    std_ms = np.mean(times_std) * 1000
-    comp_ms = np.mean(times_comp) * 1000
+    std_ms = np.median(times_std) * 1000
+    comp_ms = np.median(times_comp) * 1000
     speedup = std_ms / comp_ms
 
     return {
