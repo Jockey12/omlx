@@ -41,9 +41,12 @@ def test_fused_matches_standard(m1_enabled, bits, group_size):
     global_scale = mx.array(0.5, dtype=mx.float32)
     y_std = y_std * global_scale
 
-    # Fused path
+    # Fused path: compute fused scales once, then use fused_qmm
+    fused_scales, fused_biases = m1_modelopt_fused.compute_fused_scales(
+        scales, global_scale, biases
+    )
     y_fused = m1_modelopt_fused.fused_qmm(
-        x, w, scales, global_scale, bits=bits, group_size=group_size, biases=biases
+        x, w, fused_scales, fused_biases, bits=bits, group_size=group_size
     )
 
     # Results should be close (not bit-identical due to different accumulation order)
@@ -110,9 +113,12 @@ def test_per_channel_scale(m1_enabled):
     )
     y_std = y_std * global_scale[None, :]
 
-    # Fused path
+    # Fused path: compute fused scales once, then use fused_qmm
+    fused_scales, fused_biases = m1_modelopt_fused.compute_fused_scales(
+        scales, global_scale, biases
+    )
     y_fused = m1_modelopt_fused.fused_qmm(
-        x, w, scales, global_scale, bits=4, group_size=64, biases=biases
+        x, w, fused_scales, fused_biases, bits=4, group_size=64
     )
 
     assert y_fused.shape == y_std.shape

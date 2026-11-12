@@ -129,14 +129,26 @@ class ScaledQuantizedLinear(nn.Module):
                 True,
             )
         ):
+            # Compute fused scales once (cached via @cache decorator)
+            if not hasattr(self, "_fused_scales"):
+                fused_scales, fused_biases = m1_modelopt_fused.compute_fused_scales(
+                    self["scales"],
+                    self["global_scale"],
+                    self.get("bias"),
+                )
+                self._fused_scales = fused_scales
+                self._fused_biases = fused_biases
+            else:
+                fused_scales = self._fused_scales
+                fused_biases = self._fused_biases
+
             return m1_modelopt_fused.fused_qmm(
                 x,
                 self["weight"],
-                self["scales"],
-                self["global_scale"],
+                fused_scales,
+                fused_biases,
                 bits=self.bits,
                 group_size=self.group_size,
-                mode=self.mode,
             )
 
         # Standard path: separate matmul and scale multiply

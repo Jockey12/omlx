@@ -40,29 +40,29 @@ def benchmark_qmm_fused_scale(
         mx.eval()
 
     # Benchmark standard path (5 runs, report median)
+    # Force separate kernel launches by evaluating after qmm
     times_std = []
     for _ in range(5):
         start = time.perf_counter()
-        y_std = mx.quantized_matmul(
+        y_qmm = mx.quantized_matmul(
             x, wq, scales, biases, transpose=True, group_size=group_size, bits=bits
         )
-        y_std = y_std * global_scale
+        mx.eval(y_qmm)  # Force kernel launch
+        y_std = y_qmm * global_scale
         mx.eval(y_std)
         times_std.append(time.perf_counter() - start)
 
     # Pre-compute fused scales (done once during loading, not during inference)
-    fused_scales = scales * global_scale
-    fused_scales = fused_scales.astype(scales.dtype)
-    fused_biases = biases * global_scale if biases is not None else None
-    if fused_biases is not None:
-        fused_biases = fused_biases.astype(biases.dtype)
+    fused_scales, fused_biases = m1_modelopt_fused.compute_fused_scales(
+        scales, global_scale, biases
+    )
 
     # Benchmark fused path (5 runs, report median)
     times_fused = []
     for _ in range(5):
         start = time.perf_counter()
-        y_fused = mx.quantized_matmul(
-            x, wq, fused_scales, fused_biases, transpose=True, group_size=group_size, bits=bits
+        y_fused = m1_modelopt_fused.fused_qmm(
+            x, wq, fused_scales, fused_biases, bits=bits, group_size=group_size
         )
         mx.eval(y_fused)
         times_fused.append(time.perf_counter() - start)

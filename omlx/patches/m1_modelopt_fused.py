@@ -107,42 +107,23 @@ def eligible(
     return True
 
 
-def fused_qmm(
-    x: mx.array,
-    weight: mx.array,
+def compute_fused_scales(
     scales: mx.array,
     global_scale: mx.array,
-    *,
-    bits: int,
-    group_size: int,
-    mode: str = "mxfp8",
     biases: mx.array | None = None,
-) -> mx.array:
-    """Fused quantized matmul with global scale application.
+) -> tuple[mx.array, mx.array | None]:
+    """Compute fused scales and biases by folding in the global scale.
 
-    Computes: (x @ weight.T * scales + biases) * global_scale
-
-    On M1, this fuses the global scale into the per-group scales to avoid
-    a separate multiply kernel launch, saving memory bandwidth.
+    This should be called once during loading, not on every forward pass.
 
     Args:
-        x: Input array of shape (M, K)
-        weight: Packed quantized weights of shape (N, K * bits // 32)
-        scales: Per-group scales of shape (N, K // group_size)
+        scales: Per-group scales
         global_scale: Global scale factor (scalar or per-channel)
-        bits: Weight bit width
-        group_size: Quantization group size
-        mode: Quantization mode ("mxfp8" or "nvfp4")
         biases: Optional per-group biases
 
     Returns:
-        Output array of shape (M, N)
+        Tuple of (fused_scales, fused_biases)
     """
-    M, K = x.shape
-    N = weight.shape[0]
-
-    # Fold the global scale into the per-group scales and biases to avoid
-    # a separate multiply kernel launch. This is the key optimization for M1.
     if global_scale.ndim == 0:
         # Scalar scale: multiply all per-group scales and biases
         fused_scales = scales * global_scale
@@ -160,9 +141,41 @@ def fused_qmm(
     if fused_biases is not None:
         fused_biases = fused_biases.astype(biases.dtype)
 
-    # Now perform the quantized matmul with the fused scales and biases
-    # Note: mode is not passed here because the scale type determines the mode.
-    # float16 scales use the default mode, uint8 scales use mxfp8/nvfp4 mode.
+    return fused_scales, fused_biases
+
+
+def fused_qmm(
+    x: mx.array,
+    weight: mx.array,
+    fused_scales: mx.array,
+    fused_biases: mx.array | None = None,
+    *,
+    bits: int,
+    group_size: int,
+) -> mx.array:
+    """Fused quantized matmul with pre-computed fused scales.
+
+    Args:
+        x: Input array of shape (M, K)
+        weight: Packed quantized weights of shape (N, K * bits // 32)
+        fused_scales: Pre-computed fused scales
+        fused_biases: Pre-computed fused biases (optional)
+        bits: Weight bit width
+        group_size: Quantization group size
+
+    Returns:
+        Output array of shape (M, N)
+    """
+    # Validate input shapes
+    M, K = x.shape
+    N = weight.shape[0]
+    if fused_scales.shape != (N, K // group_size):
+        raise ValueError(
+            f"Fused scales shape mismatch: expected ({N}, {K // group_size}), "
+            f"got {fused_scales.shape}"
+        )
+
+    # Perform the quantized matmul with the fused scales and biases
     result = mx.quantized_matmul(
         x,
         weight,
@@ -224,15 +237,26 @@ class FusedScaledQuantizedLinear(nn.Module):
         M, K = x.shape
         N = self.output_dims
         if eligible(M, K, N, self.bits, self.group_size, x.dtype, True):
+            # Compute fused scales once (cached)
+            if not hasattr(self, "_fused_scales"):
+                fused_scales, fused_biases = compute_fused_scales(
+                    self.scales,
+                    self.global_scale,
+                    self.get("biases"),
+                )
+                self._fused_scales = fused_scales
+                self._fused_biases = fused_biases
+            else:
+                fused_scales = self._fused_scales
+                fused_biases = self._fused_biases
+
             return fused_qmm(
                 x,
                 self.weight,
-                self.scales,
-                self.global_scale,
+                fused_scales,
+                fused_biases,
                 bits=self.bits,
                 group_size=self.group_size,
-                mode=self.mode,
-                biases=self.get("biases"),
             )
 
         # Fall back to the standard path
