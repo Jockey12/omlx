@@ -54,7 +54,7 @@ def benchmark_qmm_fused_scale(
 
     # Pre-compute fused scales (done once during loading, not during inference)
     fused_scales, fused_biases = m1_modelopt_fused.compute_fused_scales(
-        scales, global_scale, biases
+        scales, global_scale, bits, group_size, biases
     )
 
     # Benchmark fused path (5 runs, report median)
@@ -62,7 +62,8 @@ def benchmark_qmm_fused_scale(
     for _ in range(5):
         start = time.perf_counter()
         y_fused = m1_modelopt_fused.fused_qmm(
-            x, wq, fused_scales, fused_biases, bits=bits, group_size=group_size
+            x, wq, fused_scales, bits=bits, group_size=group_size,
+            bias=fused_biases
         )
         mx.eval(y_fused)
         times_fused.append(time.perf_counter() - start)

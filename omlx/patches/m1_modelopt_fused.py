@@ -110,36 +110,51 @@ def eligible(
 def compute_fused_scales(
     scales: mx.array,
     global_scale: mx.array,
+    bits: int,
+    group_size: int,
     biases: mx.array | None = None,
 ) -> tuple[mx.array, mx.array | None]:
     """Compute fused scales and biases by folding in the global scale.
 
     This should be called once during loading, not on every forward pass.
+    Handles both float16 scales (from mx.quantize) and uint8 E4M3 FP8 scales
+    (from actual checkpoints).
 
     Args:
-        scales: Per-group scales
+        scales: Per-group scales (float16 or uint8 E4M3 FP8 encoded)
         global_scale: Global scale factor (scalar or per-channel)
+        bits: Weight bit width (4 or 8)
+        group_size: Quantization group size
         biases: Optional per-group biases
 
     Returns:
         Tuple of (fused_scales, fused_biases)
     """
-    if global_scale.ndim == 0:
-        # Scalar scale: multiply all per-group scales and biases
-        fused_scales = scales * global_scale
-        fused_biases = biases * global_scale if biases is not None else None
-    else:
-        # Per-channel scale: broadcast multiply
-        fused_scales = scales * global_scale[:, None]
-        if biases is not None:
-            fused_biases = biases * global_scale[:, None]
+    if scales.dtype == mx.uint8:
+        # E4M3 FP8 encoded scales: decode, multiply, re-encode
+        scales_float = mx.from_fp8(scales, dtype=mx.float32)
+        if global_scale.ndim == 0:
+            fused_scales_float = scales_float * global_scale
         else:
-            fused_biases = None
+            fused_scales_float = scales_float * global_scale[:, None]
+        fused_scales = mx.to_fp8(fused_scales_float)
+    else:
+        # Float scales: multiply directly
+        if global_scale.ndim == 0:
+            fused_scales = scales * global_scale
+        else:
+            fused_scales = scales * global_scale[:, None]
+        fused_scales = fused_scales.astype(scales.dtype)
 
-    # Cast back to the original scale type to avoid type promotion issues
-    fused_scales = fused_scales.astype(scales.dtype)
-    if fused_biases is not None:
+    # Scale the biases as well
+    if biases is not None:
+        if global_scale.ndim == 0:
+            fused_biases = biases * global_scale
+        else:
+            fused_biases = biases * global_scale[:, None]
         fused_biases = fused_biases.astype(biases.dtype)
+    else:
+        fused_biases = None
 
     return fused_scales, fused_biases
 
@@ -148,43 +163,69 @@ def fused_qmm(
     x: mx.array,
     weight: mx.array,
     fused_scales: mx.array,
-    fused_biases: mx.array | None = None,
     *,
     bits: int,
     group_size: int,
+    mode: str | None = None,
+    bias: mx.array | None = None,
 ) -> mx.array:
     """Fused quantized matmul with pre-computed fused scales.
 
     Args:
-        x: Input array of shape (M, K)
+        x: Input array of shape (M, K) or (B, S, K)
         weight: Packed quantized weights of shape (N, K * bits // 32)
         fused_scales: Pre-computed fused scales
-        fused_biases: Pre-computed fused biases (optional)
         bits: Weight bit width
         group_size: Quantization group size
+        mode: Quantization mode ("mxfp8" or "nvfp4")
+        bias: Optional output bias of shape (N,)
 
     Returns:
-        Output array of shape (M, N)
+        Output array of shape (M, N) or (B, S, N)
     """
-    # Validate input shapes
-    M, K = x.shape
+    # Handle 3D inputs by reshaping to 2D
+    if x.ndim == 3:
+        B, S, K = x.shape
+        x_2d = x.reshape(B * S, K)
+    else:
+        M, K = x.shape
+        x_2d = x
+
     N = weight.shape[0]
+
+    # Validate fused scales shape
     if fused_scales.shape != (N, K // group_size):
         raise ValueError(
             f"Fused scales shape mismatch: expected ({N}, {K // group_size}), "
             f"got {fused_scales.shape}"
         )
 
-    # Perform the quantized matmul with the fused scales and biases
-    result = mx.quantized_matmul(
-        x,
-        weight,
-        fused_scales,
-        fused_biases,
-        transpose=True,
-        group_size=group_size,
-        bits=bits,
-    )
+    # Perform the quantized matmul with the fused scales
+    if mode is not None:
+        result = mx.quantized_matmul(
+            x_2d,
+            weight,
+            fused_scales,
+            transpose=True,
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+        )
+    else:
+        # For affine quantization, pass the fused bias to mx.quantized_matmul
+        result = mx.quantized_matmul(
+            x_2d,
+            weight,
+            fused_scales,
+            bias,
+            transpose=True,
+            group_size=group_size,
+            bits=bits,
+        )
+
+    # Reshape back to 3D if needed
+    if x.ndim == 3:
+        result = result.reshape(B, S, N)
 
     return result
 
@@ -234,7 +275,10 @@ class FusedScaledQuantizedLinear(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         """Forward pass with fused scale application."""
         # Check if we should use the fused kernel
-        M, K = x.shape
+        if x.ndim == 3:
+            M, K = x.shape[0] * x.shape[1], x.shape[2]
+        else:
+            M, K = x.shape
         N = self.output_dims
         if eligible(M, K, N, self.bits, self.group_size, x.dtype, True):
             # Compute fused scales once (cached)
@@ -242,6 +286,8 @@ class FusedScaledQuantizedLinear(nn.Module):
                 fused_scales, fused_biases = compute_fused_scales(
                     self.scales,
                     self.global_scale,
+                    self.bits,
+                    self.group_size,
                     self.get("biases"),
                 )
                 self._fused_scales = fused_scales
@@ -254,9 +300,10 @@ class FusedScaledQuantizedLinear(nn.Module):
                 x,
                 self.weight,
                 fused_scales,
-                fused_biases,
                 bits=self.bits,
                 group_size=self.group_size,
+                mode=self.mode,
+                bias=fused_biases if self.has_bias else None,
             )
 
         # Fall back to the standard path

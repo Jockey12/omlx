@@ -117,11 +117,15 @@ class ScaledQuantizedLinear(nn.Module):
 
     def __call__(self, x):
         # On M1, use the fused scale kernel to avoid a separate multiply pass
+        if x.ndim == 3:
+            M, K = x.shape[0] * x.shape[1], x.shape[2]
+        else:
+            M, K = x.shape
         if (
             m1_modelopt_fused.enabled()
             and m1_modelopt_fused.eligible(
-                x.shape[0],
-                x.shape[1],
+                M,
+                K,
                 self.weight.shape[0],
                 self.bits,
                 self.group_size,
@@ -129,12 +133,14 @@ class ScaledQuantizedLinear(nn.Module):
                 True,
             )
         ):
-            # Compute fused scales once (cached via @cache decorator)
+            # Compute fused scales once (cached)
             if not hasattr(self, "_fused_scales"):
                 fused_scales, fused_biases = m1_modelopt_fused.compute_fused_scales(
                     self["scales"],
                     self["global_scale"],
-                    self.get("bias"),
+                    self.bits,
+                    self.group_size,
+                    self.get("biases"),
                 )
                 self._fused_scales = fused_scales
                 self._fused_biases = fused_biases
@@ -146,9 +152,10 @@ class ScaledQuantizedLinear(nn.Module):
                 x,
                 self["weight"],
                 fused_scales,
-                fused_biases,
                 bits=self.bits,
                 group_size=self.group_size,
+                mode=self.mode,
+                bias=fused_biases,
             )
 
         # Standard path: separate matmul and scale multiply
